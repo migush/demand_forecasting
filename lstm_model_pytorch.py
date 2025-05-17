@@ -9,10 +9,14 @@ from datetime import datetime
 import os
 import pandas as pd
 from pathlib import Path
+import platform
+import json
+import time
 
 # Create logs directory if it doesn't exist
 os.makedirs('logs', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
+os.makedirs('data/processed', exist_ok=True)
 
 # Set up logging
 logging.basicConfig(
@@ -23,6 +27,181 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+def get_device():
+    """
+    Get the best available device for PyTorch.
+    Priority: CUDA GPU > Apple MPS > CPU
+    
+    Returns:
+        torch.device: The best available device
+    """
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        logging.info(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+        # Set memory growth to prevent OOM errors
+        torch.cuda.set_per_process_memory_fraction(0.8)  # Use 80% of available GPU memory
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+        logging.info("Using Apple Silicon MPS")
+    else:
+        device = torch.device('cpu')
+        logging.info(f"Using CPU: {platform.processor()}")
+    
+    return device
+
+def compute_global_statistics(data_path, stats_path='data/processed/stats.json', chunk_size=100000):
+    """
+    Compute global statistics for feature scaling from the prepared sales data.
+    
+    Args:
+        data_path: Path to the prepared sales data file (CSV or Parquet)
+        stats_path: Path to save the computed statistics as JSON
+        chunk_size: Number of rows to process at once
+    
+    Returns:
+        Dictionary with the computed statistics
+    """
+    start_time = time.time()
+    data_path = Path(data_path)
+    
+    logging.info(f"Computing global scaling statistics for {data_path}")
+    
+    # Check if stats file already exists
+    if os.path.exists(stats_path):
+        logging.info(f"Loading existing statistics from {stats_path}")
+        with open(stats_path, 'r') as f:
+            return json.load(f)
+    
+    # Initialize accumulators for online statistics calculation
+    count = 0
+    means = {}
+    m2s = {}  # For variance calculation
+    mins = {}
+    maxs = {}
+    
+    # Determine the file type
+    is_parquet = data_path.suffix.lower() == '.parquet'
+    
+    # For column detection
+    first_chunk = True
+    feature_columns = []
+    
+    # Process data in chunks to handle large files
+    if is_parquet:
+        # Estimate total rows for progress reporting
+        table = pd.read_parquet(data_path, columns=['unique_id'])
+        total_rows = len(table)
+        del table  # Free memory
+        
+        # Process in chunks using PyArrow
+        for i, chunk in enumerate(pd.read_parquet(data_path, chunksize=chunk_size)):
+            process_chunk_for_stats(chunk, i, count, means, m2s, mins, maxs, first_chunk, feature_columns, total_rows)
+            first_chunk = False
+            count += len(chunk)
+    else:
+        # Estimate total rows for CSV (cheaper than counting all rows)
+        with open(data_path, 'r') as f:
+            total_rows = sum(1 for _ in f) - 1  # Subtract header
+        
+        # Process in chunks
+        for i, chunk in enumerate(pd.read_csv(data_path, chunksize=chunk_size)):
+            process_chunk_for_stats(chunk, i, count, means, m2s, mins, maxs, first_chunk, feature_columns, total_rows)
+            first_chunk = False
+            count += len(chunk)
+    
+    if count == 0:
+        logging.error("No valid data found for computing statistics")
+        raise ValueError("No valid data found")
+    
+    # Calculate final statistics
+    stats = {
+        'count': count,
+        'means': means,
+        'stds': {},
+        'mins': mins,
+        'maxs': maxs,
+        'feature_columns': feature_columns
+    }
+    
+    # Compute standard deviations with protection against zero variance
+    for col in m2s:
+        # Apply Bessel's correction for sample variance
+        variance = m2s[col] / (count - 1) if count > 1 else 0
+        # Guard against zero variance
+        stats['stds'][col] = max(np.sqrt(variance), 1e-9)
+    
+    # Save statistics to JSON
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+    
+    elapsed_time = time.time() - start_time
+    logging.info(f"Statistics computed for {count:,} rows in {elapsed_time:.2f} seconds")
+    logging.info(f"Statistics saved to {stats_path}")
+    
+    return stats
+
+def process_chunk_for_stats(chunk, chunk_idx, current_count, means, m2s, mins, maxs, first_chunk, feature_columns, total_rows):
+    """
+    Process a chunk of data to update running statistics.
+    Uses Welford's online algorithm for computing mean and variance.
+    
+    Args:
+        chunk: DataFrame chunk to process
+        chunk_idx: Index of the current chunk
+        current_count: Current count of processed rows
+        means: Dictionary of running means
+        m2s: Dictionary of running M2 values for variance calculation
+        mins: Dictionary of minimum values
+        maxs: Dictionary of maximum values
+        first_chunk: Whether this is the first chunk (for feature detection)
+        feature_columns: List to store feature column names
+        total_rows: Estimated total rows for progress reporting
+    """
+    # Log progress
+    logging.info(f"Processing chunk {chunk_idx+1}, rows {current_count+1:,} to {current_count+len(chunk):,} of ~{total_rows:,}")
+    
+    # Drop rows with any NaN values
+    original_len = len(chunk)
+    chunk = chunk.dropna()
+    if len(chunk) < original_len:
+        logging.info(f"Dropped {original_len - len(chunk)} rows with NaN values")
+    
+    if len(chunk) == 0:
+        logging.warning(f"Chunk {chunk_idx+1} has no valid rows after dropping NaNs")
+        return
+    
+    # Identify numeric feature columns if this is the first chunk
+    if first_chunk:
+        feature_columns.extend([col for col in chunk.columns 
+                               if col not in ['date', 'unique_id', 'sales']
+                               and np.issubdtype(chunk[col].dtype, np.number)])
+        logging.info(f"Identified {len(feature_columns)} numeric feature columns: {feature_columns}")
+        
+        # Initialize accumulators for each column
+        for col in feature_columns:
+            means[col] = 0
+            m2s[col] = 0
+            mins[col] = float('inf')
+            maxs[col] = float('-inf')
+    
+    # Update statistics for each feature column
+    for col in feature_columns:
+        # Only process numeric columns
+        if col in chunk.columns and np.issubdtype(chunk[col].dtype, np.number):
+            # Update min and max
+            col_min = chunk[col].min()
+            col_max = chunk[col].max()
+            mins[col] = min(mins[col], col_min)
+            maxs[col] = max(maxs[col], col_max)
+            
+            # Update mean and M2 using Welford's online algorithm
+            for val in chunk[col]:
+                current_count += 1
+                delta = val - means[col]
+                means[col] += delta / current_count
+                delta2 = val - means[col]
+                m2s[col] += delta * delta2
 
 class TimeSeriesDataset(Dataset):
     """Dataset for on-demand loading and processing of time series data for a product"""
@@ -44,44 +223,49 @@ class TimeSeriesDataset(Dataset):
         self.train = train
         self.test_size = test_size
         
-        # Check if data file is Parquet or CSV
-        if self.data_path.suffix.lower() == '.parquet':
-            # Sample a small amount to get metadata
-            sample_df = pd.read_parquet(self.data_path, rows=1000)
-        else:
-            # Assume CSV
-            sample_df = pd.read_csv(self.data_path, nrows=1000)
+        logging.info(f"Initializing {'training' if train else 'testing'} dataset")
+        logging.info(f"Data path: {self.data_path}")
+        logging.info(f"Lookback window: {lookback} steps")
         
-        # Get feature columns if not provided
+        # Load or compute global statistics for feature scaling
+        stats_path = 'data/processed/stats.json'
+        self.stats = compute_global_statistics(data_path, stats_path)
+        
+        # Get feature columns from stats or provided list
         if feature_columns is None:
-            self.feature_columns = [col for col in sample_df.columns 
-                                   if col not in ['date', 'unique_id', 'sales']]
+            self.feature_columns = self.stats['feature_columns']
+            logging.info(f"Using {len(self.feature_columns)} feature columns from global stats")
         else:
             self.feature_columns = feature_columns
-            
+            logging.info(f"Using {len(self.feature_columns)} provided feature columns")
+        
         self.n_features = len(self.feature_columns)
         
         # Get all unique product IDs from the data if not provided
         if product_ids is None:
+            logging.info("Loading unique product IDs from data...")
             if self.data_path.suffix.lower() == '.parquet':
                 unique_ids_df = pd.read_parquet(self.data_path, columns=['unique_id'])
             else:
                 unique_ids_df = pd.read_csv(self.data_path, usecols=['unique_id'])
             self.product_ids = unique_ids_df['unique_id'].unique()
+            logging.info(f"Found {len(self.product_ids)} unique products")
         else:
             self.product_ids = product_ids
+            logging.info(f"Using {len(self.product_ids)} provided product IDs")
             
         # Create index of product sequences
+        logging.info("Creating product sequence index...")
         self._create_product_index()
-        
-        # Compute normalization statistics across the dataset and save them
-        self._compute_normalization_stats()
         
     def _create_product_index(self):
         """Create an index of sequences for each product"""
         self.product_sequences = []
+        total_sequences = 0
         
-        for product_id in self.product_ids:
+        for i, product_id in enumerate(self.product_ids):
+            logging.info(f"Processing product {i+1}/{len(self.product_ids)}")
+            
             # Read data for this product
             if self.data_path.suffix.lower() == '.parquet':
                 product_df = pd.read_parquet(self.data_path, filters=[('unique_id', '==', product_id)])
@@ -109,46 +293,11 @@ class TimeSeriesDataset(Dataset):
                     # Test set: Use second part
                     for i in range(split_point, n_sequences):
                         self.product_sequences.append((product_id, i))
-        
-    def _compute_normalization_stats(self):
-        """Compute mean and std for normalization"""
-        # We'll use a sample of products to estimate the normalization stats
-        sample_size = min(100, len(self.product_ids))
-        sampled_products = np.random.choice(self.product_ids, sample_size, replace=False)
-        
-        # Collect feature values
-        feature_values = []
-        
-        for product_id in sampled_products:
-            # Load data for this product
-            if self.data_path.suffix.lower() == '.parquet':
-                product_df = pd.read_parquet(self.data_path, filters=[('unique_id', '==', product_id)])
-            else:
-                product_df = pd.read_csv(self.data_path)
-                product_df = product_df[product_df['unique_id'] == product_id]
                 
-            if not product_df.empty:
-                feature_values.append(product_df[self.feature_columns].values)
+                total_sequences += n_sequences
         
-        # Combine all feature values and compute stats
-        if feature_values:
-            all_features = np.concatenate(feature_values, axis=0)
-            self.feature_mean = np.mean(all_features, axis=0)
-            self.feature_std = np.std(all_features, axis=0)
-            # Prevent division by zero
-            self.feature_std[self.feature_std == 0] = 1.0
-            
-            # Save normalization parameters
-            os.makedirs('data/processed', exist_ok=True)
-            np.save('data/processed/X_mean.npy', self.feature_mean)
-            np.save('data/processed/X_std.npy', self.feature_std)
-            
-            logging.info(f"Normalization stats computed from {sample_size} products")
-        else:
-            # If no data, use zeros and ones
-            self.feature_mean = np.zeros(self.n_features)
-            self.feature_std = np.ones(self.n_features)
-            logging.warning("No data found to compute normalization stats")
+        logging.info(f"Created {len(self.product_sequences)} sequences for {'training' if self.train else 'testing'}")
+        logging.info(f"Average sequences per product: {total_sequences/len(self.product_ids):.2f}")
     
     def __len__(self):
         """Return the number of sequences in the dataset"""
@@ -173,10 +322,16 @@ class TimeSeriesDataset(Dataset):
         sequence = product_df[self.feature_columns].iloc[seq_start:seq_start + self.lookback].values
         target = product_df['sales'].iloc[seq_start + self.lookback]
         
-        # Apply normalization on-the-fly
-        sequence = (sequence - self.feature_mean) / self.feature_std
+        # Apply normalization on-the-fly using global statistics
+        normalized_sequence = np.zeros_like(sequence, dtype=np.float32)
+        for i, col in enumerate(self.feature_columns):
+            # Get scaling stats for this feature
+            mean = self.stats['means'][col]
+            std = self.stats['stds'][col]
+            # Apply z-score normalization
+            normalized_sequence[:, i] = (sequence[:, i] - mean) / std
         
-        return torch.tensor(sequence, dtype=torch.float32), torch.tensor([target], dtype=torch.float32)
+        return torch.tensor(normalized_sequence, dtype=torch.float32), torch.tensor([target], dtype=torch.float32)
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
@@ -245,7 +400,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
         model: PyTorch LSTM model
         train_loader: DataLoader for training data
         val_loader: DataLoader for validation data
-        device: Device to train on (CPU/GPU)
+        device: Device to train on (CPU/GPU/MPS)
         epochs: Number of training epochs
         learning_rate: Learning rate for optimizer
     
@@ -253,7 +408,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
         Trained model and training history
     """
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)  # Added L2 regularization
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     # Initialize history
@@ -307,7 +462,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
             loss.backward()
             
             # Gradient clipping with smaller max_norm
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # Reduced max_norm
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             
             optimizer.step()
             
@@ -416,9 +571,8 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
     return model, history
 
 def main():
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f"Using device: {device}")
+    # Get the best available device
+    device = get_device()
     
     # Define parameters
     lookback = 30
@@ -429,7 +583,25 @@ def main():
     batch_size = 64
     epochs = 50
     test_size = 0.2
-    num_workers = 4  # Number of parallel workers for data loading
+    
+    # Adjust batch size based on device
+    if device.type == 'cuda':
+        # Use larger batch size for GPU
+        batch_size = 128
+    elif device.type == 'mps':
+        # Use medium batch size for MPS
+        batch_size = 96
+    else:
+        # Use smaller batch size for CPU
+        batch_size = 32
+    
+    # Adjust number of workers based on device
+    if device.type == 'cuda':
+        num_workers = 4  # More workers for GPU
+    elif device.type == 'mps':
+        num_workers = 2  # Fewer workers for MPS
+    else:
+        num_workers = 0  # No workers for CPU to avoid overhead
     
     # Create datasets with streaming data loading
     data_path = 'data/prepared_sales_data.csv'  # or change to .parquet if converted
@@ -450,13 +622,13 @@ def main():
         test_size=test_size
     )
     
-    # Create data loaders
+    # Create data loaders with device-specific settings
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=(device.type != 'cpu')  # Enable pin_memory for GPU/MPS
     )
     
     test_loader = DataLoader(
@@ -464,11 +636,13 @@ def main():
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=(device.type != 'cpu')  # Enable pin_memory for GPU/MPS
     )
     
     logging.info(f"Training samples: {len(train_dataset)}")
     logging.info(f"Testing samples: {len(test_dataset)}")
+    logging.info(f"Using batch size: {batch_size}")
+    logging.info(f"Using {num_workers} data loading workers")
     
     # Create model
     input_size = len(train_dataset.feature_columns)
