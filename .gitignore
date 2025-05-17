@@ -1,0 +1,54 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Data and large artifacts
+data/*
+!data/.gitkeep
+!data/DATA_DESCRIPTION.md
+
+# Processed data
+*.npy
+*.csv
+*.parquet
+
+# Logs and outputs
+logs/*
+!logs/.gitkeep
+*.log
+training_*.log
+
+# Model artifacts
+outputs/*
+!outputs/.gitkeep
+*.pth
+best_model.pth
+*.pt
+
+# Visualizations
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride 
