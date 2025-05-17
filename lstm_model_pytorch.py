@@ -12,11 +12,15 @@ from pathlib import Path
 import platform
 import json
 import time
+from torch.utils.tensorboard import SummaryWriter
+from packaging import version
+import warnings
 
 # Create logs directory if it doesn't exist
 os.makedirs('logs', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
 os.makedirs('data/processed', exist_ok=True)
+os.makedirs('runs', exist_ok=True)
 
 # Set up logging
 logging.basicConfig(
@@ -49,6 +53,25 @@ def get_device():
         logging.info(f"Using CPU: {platform.processor()}")
     
     return device
+
+def can_use_amp(device):
+    """
+    Determine if Automatic Mixed Precision (AMP) can be used on the current device.
+    
+    Args:
+        device: PyTorch device
+    
+    Returns:
+        bool: Whether AMP can be used
+        dtype: Recommended dtype for mixed precision
+    """
+    if device.type == 'cuda':
+        return True, torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    elif device.type == 'mps' and torch.__version__ >= '2.1.0':
+        # MPS supports bfloat16 in PyTorch 2.1+
+        return True, torch.bfloat16
+    else:
+        return False, torch.float32
 
 def compute_global_statistics(data_path, stats_path='data/processed/stats.json', chunk_size=100000):
     """
@@ -373,14 +396,10 @@ class LSTMModel(nn.Module):
                 nn.init.zeros_(param)
         
     def forward(self, x):
-        # Initialize hidden state with zeros
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        # Let PyTorch handle the hidden state initialization automatically
+        out, _ = self.lstm(x)
         
-        # Forward propagate LSTM
-        out, _ = self.lstm(x, (h0, c0))
-        
-        # Normalize LSTM output
+        # Normalize LSTM output (taking the last time step output)
         out = self.lstm_norm(out[:, -1, :])
         
         # Fully connected layers with normalization
@@ -394,7 +413,7 @@ class LSTMModel(nn.Module):
 
 def train_model(model, train_loader, val_loader, device, epochs=50, learning_rate=0.001):
     """
-    Train the LSTM model with improved monitoring.
+    Train the LSTM model with improved training techniques.
     
     Args:
         model: PyTorch LSTM model
@@ -410,6 +429,18 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(f'runs/lstm_training_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+    
+    # Determine if we can use Automatic Mixed Precision
+    use_amp, amp_dtype = can_use_amp(device)
+    if use_amp:
+        logging.info(f"Using Automatic Mixed Precision with {amp_dtype}")
+        # Initialize gradient scaler for AMP
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    else:
+        logging.info("Not using Automatic Mixed Precision")
     
     # Initialize history
     history = {
@@ -429,6 +460,10 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
     logging.info(f"Training samples: {len(train_loader.dataset)}")
     logging.info(f"Validation samples: {len(val_loader.dataset)}")
     
+    # Log model graph to TensorBoard
+    sample_input = next(iter(train_loader))[0][:1].to(device)
+    writer.add_graph(model, sample_input)
+    
     for epoch in range(epochs):
         # Training phase
         model.train()
@@ -444,30 +479,46 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             
-            # Forward pass
-            y_pred = model(X_batch)
+            # Forward pass with AMP
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                y_pred = model(X_batch)
+                
+                # Check for NaN in predictions
+                if torch.isnan(y_pred).any():
+                    logging.error(f"NaN detected in predictions at batch {batch_count}")
+                    logging.error(f"Input shape: {X_batch.shape}, Output shape: {y_pred.shape}")
+                    logging.error(f"Input stats - Mean: {X_batch.mean():.4f}, Std: {X_batch.std():.4f}")
+                    logging.error(f"Output stats - Mean: {y_pred.mean():.4f}, Std: {y_pred.std():.4f}")
+                    raise ValueError("NaN detected in model predictions")
+                
+                loss = criterion(y_pred, y_batch)
             
-            # Check for NaN in predictions
-            if torch.isnan(y_pred).any():
-                logging.error(f"NaN detected in predictions at batch {batch_count}")
-                logging.error(f"Input shape: {X_batch.shape}, Output shape: {y_pred.shape}")
-                logging.error(f"Input stats - Mean: {X_batch.mean():.4f}, Std: {X_batch.std():.4f}")
-                logging.error(f"Output stats - Mean: {y_pred.mean():.4f}, Std: {y_pred.std():.4f}")
-                raise ValueError("NaN detected in model predictions")
-            
-            loss = criterion(y_pred, y_batch)
-            
-            # Backward pass and optimize
+            # Backward pass and optimize with AMP
             optimizer.zero_grad()
-            loss.backward()
             
-            # Gradient clipping with smaller max_norm
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-            
-            optimizer.step()
+            if use_amp:
+                # Scale loss and call backward
+                scaler.scale(loss).backward()
+                
+                # Clip gradients by value (more stable than norm clipping)
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_value_(model.parameters(), 1.0)
+                
+                # Step optimizer using scaler
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard training without AMP
+                loss.backward()
+                
+                # Clip gradients by value
+                torch.nn.utils.clip_grad_value_(model.parameters(), 1.0)
+                
+                optimizer.step()
             
             train_loss += loss.item()
-            train_mae += torch.mean(torch.abs(y_pred - y_batch)).item()
+            mae = torch.mean(torch.abs(y_pred - y_batch)).item()
+            train_mae += mae
             
             # Convert to numpy and check for NaN
             pred_np = y_pred.cpu().detach().numpy()
@@ -480,6 +531,10 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
             train_predictions.extend(pred_np)
             train_targets.extend(target_np)
             batch_count += 1
+            
+            # Log batch metrics to TensorBoard
+            writer.add_scalar('Batch/Train_Loss', loss.item(), epoch * len(train_loader) + batch_count)
+            writer.add_scalar('Batch/Train_MAE', mae, epoch * len(train_loader) + batch_count)
             
             if batch_count % 10 == 0:  # Log every 10 batches
                 logging.info(f"Batch {batch_count}/{len(train_loader)} - Loss: {loss.item():.4f}")
@@ -496,15 +551,21 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                y_pred = model(X_batch)
                 
-                # Check for NaN in predictions
-                if torch.isnan(y_pred).any():
-                    logging.error("NaN detected in validation predictions")
-                    raise ValueError("NaN detected in validation predictions")
+                # Forward pass with AMP
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    y_pred = model(X_batch)
+                    
+                    # Check for NaN in predictions
+                    if torch.isnan(y_pred).any():
+                        logging.error("NaN detected in validation predictions")
+                        raise ValueError("NaN detected in validation predictions")
+                    
+                    batch_loss = criterion(y_pred, y_batch).item()
                 
-                val_loss += criterion(y_pred, y_batch).item()
-                val_mae += torch.mean(torch.abs(y_pred - y_batch)).item()
+                val_loss += batch_loss
+                batch_mae = torch.mean(torch.abs(y_pred - y_batch)).item()
+                val_mae += batch_mae
                 
                 # Convert to numpy and check for NaN
                 pred_np = y_pred.cpu().numpy()
@@ -544,6 +605,19 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
         history['val_mae'].append(val_mae)
         history['learning_rate'].append(current_lr)
         
+        # Log to TensorBoard
+        writer.add_scalar('Epoch/Train_Loss', train_loss, epoch)
+        writer.add_scalar('Epoch/Val_Loss', val_loss, epoch)
+        writer.add_scalar('Epoch/Train_MAE', train_mae, epoch)
+        writer.add_scalar('Epoch/Val_MAE', val_mae, epoch)
+        writer.add_scalar('Epoch/Train_RMSE', train_rmse, epoch)
+        writer.add_scalar('Epoch/Val_RMSE', val_rmse, epoch)
+        writer.add_scalar('Epoch/Learning_Rate', current_lr, epoch)
+        
+        # Log histograms of model parameters
+        for name, param in model.named_parameters():
+            writer.add_histogram(f'Parameters/{name}', param, epoch)
+        
         # Log progress
         logging.info(f"\nEpoch {epoch+1} Summary:")
         logging.info(f"Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f}, Train RMSE: {train_rmse:.4f}")
@@ -568,7 +642,102 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
                 logging.info("Early stopping triggered")
                 break
     
+    # Close TensorBoard writer
+    writer.close()
+    
     return model, history
+
+def evaluate_model(model, test_loader, device):
+    """
+    Evaluate the model on the test set.
+    
+    Args:
+        model: Trained PyTorch model
+        test_loader: DataLoader for test data
+        device: Device to evaluate on
+    
+    Returns:
+        test_loss, test_mae: Loss and Mean Absolute Error on test set
+    """
+    criterion = nn.MSELoss()
+    model.eval()
+    
+    test_loss = 0
+    test_mae = 0
+    predictions = []
+    targets = []
+    
+    # Determine if we can use Automatic Mixed Precision
+    use_amp, amp_dtype = can_use_amp(device)
+    
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            
+            # Forward pass with AMP
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                y_pred = model(X_batch)
+                batch_loss = criterion(y_pred, y_batch).item()
+            
+            test_loss += batch_loss
+            test_mae += torch.mean(torch.abs(y_pred - y_batch)).item()
+            
+            # Collect predictions and targets for additional metrics
+            predictions.extend(y_pred.cpu().numpy())
+            targets.extend(y_batch.cpu().numpy())
+    
+    # Calculate average metrics
+    test_loss /= len(test_loader)
+    test_mae /= len(test_loader)
+    
+    # Additional metrics
+    predictions = np.array(predictions).flatten()
+    targets = np.array(targets).flatten()
+    rmse = np.sqrt(mean_squared_error(targets, predictions))
+    
+    logging.info(f"Test Loss: {test_loss:.4f}")
+    logging.info(f"Test MAE: {test_mae:.4f}")
+    logging.info(f"Test RMSE: {rmse:.4f}")
+    
+    return test_loss, test_mae, rmse
+
+def plot_training_history(history):
+    """
+    Plot training history.
+    
+    Args:
+        history: Dictionary containing training history
+    """
+    plt.figure(figsize=(12, 10))
+    
+    # Plot loss
+    plt.subplot(2, 2, 1)
+    plt.plot(history['train_loss'], label='Training Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss')
+    plt.legend()
+    
+    # Plot MAE
+    plt.subplot(2, 2, 2)
+    plt.plot(history['train_mae'], label='Training MAE')
+    plt.plot(history['val_mae'], label='Validation MAE')
+    plt.title('Mean Absolute Error')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE')
+    plt.legend()
+    
+    # Plot learning rate
+    plt.subplot(2, 2, 3)
+    plt.semilogy(history['learning_rate'])
+    plt.title('Learning Rate')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    
+    plt.tight_layout()
+    plt.savefig('outputs/training_history.png')
+    logging.info("Training history plot saved to outputs/training_history.png")
 
 def main():
     # Get the best available device
@@ -649,6 +818,16 @@ def main():
     model = LSTMModel(input_size, hidden_size, num_layers, dropout).to(device)
     logging.info(f"Created model with {input_size} input features")
     
+    # Apply torch.compile if PyTorch version supports it
+    if hasattr(torch, 'compile') and callable(getattr(torch, 'compile')):
+        try:
+            model = torch.compile(model)
+            logging.info("Applied torch.compile() to model for faster execution")
+        except Exception as e:
+            logging.warning(f"Failed to apply torch.compile(): {str(e)}")
+    else:
+        logging.info("torch.compile() not available in this PyTorch version")
+    
     # Train the model
     model, history = train_model(
         model, 
@@ -664,8 +843,8 @@ def main():
     logging.info("Model saved to outputs/lstm_model.pth")
     
     # Evaluate on test set
-    test_loss, test_mae = evaluate_model(model, test_loader, device)
-    logging.info(f"Test Loss: {test_loss:.4f}, Test MAE: {test_mae:.4f}")
+    test_loss, test_mae, test_rmse = evaluate_model(model, test_loader, device)
+    logging.info(f"Test Loss: {test_loss:.4f}, Test MAE: {test_mae:.4f}, Test RMSE: {test_rmse:.4f}")
     
     # Plot training history
     plot_training_history(history)
