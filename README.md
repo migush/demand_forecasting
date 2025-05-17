@@ -7,6 +7,20 @@ This project implements a demand forecasting solution using Long Short-Term Memo
 The project uses the Rohlík Sales Forecasting Challenge dataset from Kaggle. The dataset contains historical sales data from Rohlík, a Czech online grocery store. You can find the dataset and competition details at:
 [Kaggle Competition Link](https://www.kaggle.com/competitions/rohlik-sales-forecasting-challenge-v2/overview)
 
+## Data Pipeline
+
+This project uses a streaming data pipeline that loads and processes data on-demand:
+
+1. **Data Preparation**: The raw data is transformed into a prepared dataset with feature engineering (saved as CSV/Parquet)
+2. **Streaming Dataset**: During training, data is loaded for each product ID only when needed
+3. **On-the-fly Processing**: Window slicing and normalization happen in real-time
+4. **Parallel Processing**: Multiple worker processes handle data loading while GPU trains
+
+### Benefits of Streaming Pipeline:
+- Reduced memory usage (only loads necessary data)
+- Improved training speed (parallel processing)
+- Better scalability for large datasets
+
 ## Project Structure
 
 ```
@@ -24,7 +38,10 @@ demand_forecasting/
 ├── data/                      # Data directory (gitignored except for metadata)
 │   └── processed/             # Processed data files
 ├── logs/                      # Training logs
-└── outputs/                   # Model checkpoints and visualizations
+├── outputs/                   # Model checkpoints and visualizations
+├── prepare_data.py            # Script for data preparation
+├── convert_to_parquet.py      # Script to convert CSV to Parquet
+└── lstm_model_pytorch.py      # LSTM model implementation with streaming dataset
 ```
 
 ## Installation
@@ -39,35 +56,29 @@ cd demand-forecasting
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -e .
+pip install -r requirements.txt
 ```
 
 ## Usage
 
 ### Data Preparation
 
-To prepare the data with feature engineering and temporal sequences:
-
+1. Prepare the initial sales data:
 ```bash
-# First run ETL to create processed dataset
-python -m demand_forecasting.data.etl
+python prepare_data.py
+```
 
-# Then create time series sequences
-python -m demand_forecasting.data.sequence
+2. (Optional) Convert to Parquet for better performance:
+```bash
+python convert_to_parquet.py
 ```
 
 ### Training
 
-Train the model with default parameters:
+Train the model using the streaming dataset:
 
 ```bash
-python -m demand_forecasting.train
-```
-
-With custom configuration:
-
-```bash
-python -m demand_forecasting.train --config path/to/your_config.yaml
+python lstm_model_pytorch.py
 ```
 
 ### Model Architecture
@@ -111,6 +122,7 @@ training:
   batch_size: 32
   epochs: 50
   learning_rate: 0.001
+  num_workers: 4      # Number of parallel data loading workers
 ```
 
 ## Future Improvements

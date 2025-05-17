@@ -7,6 +7,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import logging
 from datetime import datetime
 import os
+import pandas as pd
+from pathlib import Path
 
 # Create logs directory if it doesn't exist
 os.makedirs('logs', exist_ok=True)
@@ -21,6 +23,160 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+class TimeSeriesDataset(Dataset):
+    """Dataset for on-demand loading and processing of time series data for a product"""
+    
+    def __init__(self, data_path, product_ids=None, lookback=30, train=True, test_size=0.2, feature_columns=None):
+        """
+        Initialize the dataset.
+        
+        Args:
+            data_path: Path to the prepared sales data file (CSV or Parquet)
+            product_ids: List of product IDs to include (None for all)
+            lookback: Number of time steps to look back
+            train: Whether this is for training or testing
+            test_size: Proportion of data to use for testing
+            feature_columns: List of feature column names (None to auto-detect)
+        """
+        self.data_path = Path(data_path)
+        self.lookback = lookback
+        self.train = train
+        self.test_size = test_size
+        
+        # Check if data file is Parquet or CSV
+        if self.data_path.suffix.lower() == '.parquet':
+            # Sample a small amount to get metadata
+            sample_df = pd.read_parquet(self.data_path, rows=1000)
+        else:
+            # Assume CSV
+            sample_df = pd.read_csv(self.data_path, nrows=1000)
+        
+        # Get feature columns if not provided
+        if feature_columns is None:
+            self.feature_columns = [col for col in sample_df.columns 
+                                   if col not in ['date', 'unique_id', 'sales']]
+        else:
+            self.feature_columns = feature_columns
+            
+        self.n_features = len(self.feature_columns)
+        
+        # Get all unique product IDs from the data if not provided
+        if product_ids is None:
+            if self.data_path.suffix.lower() == '.parquet':
+                unique_ids_df = pd.read_parquet(self.data_path, columns=['unique_id'])
+            else:
+                unique_ids_df = pd.read_csv(self.data_path, usecols=['unique_id'])
+            self.product_ids = unique_ids_df['unique_id'].unique()
+        else:
+            self.product_ids = product_ids
+            
+        # Create index of product sequences
+        self._create_product_index()
+        
+        # Compute normalization statistics across the dataset and save them
+        self._compute_normalization_stats()
+        
+    def _create_product_index(self):
+        """Create an index of sequences for each product"""
+        self.product_sequences = []
+        
+        for product_id in self.product_ids:
+            # Read data for this product
+            if self.data_path.suffix.lower() == '.parquet':
+                product_df = pd.read_parquet(self.data_path, filters=[('unique_id', '==', product_id)])
+            else:
+                # For CSV, load the entire dataset and filter (less efficient)
+                product_df = pd.read_csv(self.data_path)
+                product_df = product_df[product_df['unique_id'] == product_id]
+                
+            # Sort by date to ensure correct sequence order
+            product_df['date'] = pd.to_datetime(product_df['date'])
+            product_df = product_df.sort_values('date')
+            
+            # Calculate number of sequences for this product
+            n_sequences = max(0, len(product_df) - self.lookback)
+            
+            if n_sequences > 0:
+                # Split into train/test indices
+                split_point = int(n_sequences * (1 - self.test_size))
+                
+                if self.train:
+                    # Training set: Use first part
+                    for i in range(split_point):
+                        self.product_sequences.append((product_id, i))
+                else:
+                    # Test set: Use second part
+                    for i in range(split_point, n_sequences):
+                        self.product_sequences.append((product_id, i))
+        
+    def _compute_normalization_stats(self):
+        """Compute mean and std for normalization"""
+        # We'll use a sample of products to estimate the normalization stats
+        sample_size = min(100, len(self.product_ids))
+        sampled_products = np.random.choice(self.product_ids, sample_size, replace=False)
+        
+        # Collect feature values
+        feature_values = []
+        
+        for product_id in sampled_products:
+            # Load data for this product
+            if self.data_path.suffix.lower() == '.parquet':
+                product_df = pd.read_parquet(self.data_path, filters=[('unique_id', '==', product_id)])
+            else:
+                product_df = pd.read_csv(self.data_path)
+                product_df = product_df[product_df['unique_id'] == product_id]
+                
+            if not product_df.empty:
+                feature_values.append(product_df[self.feature_columns].values)
+        
+        # Combine all feature values and compute stats
+        if feature_values:
+            all_features = np.concatenate(feature_values, axis=0)
+            self.feature_mean = np.mean(all_features, axis=0)
+            self.feature_std = np.std(all_features, axis=0)
+            # Prevent division by zero
+            self.feature_std[self.feature_std == 0] = 1.0
+            
+            # Save normalization parameters
+            os.makedirs('data/processed', exist_ok=True)
+            np.save('data/processed/X_mean.npy', self.feature_mean)
+            np.save('data/processed/X_std.npy', self.feature_std)
+            
+            logging.info(f"Normalization stats computed from {sample_size} products")
+        else:
+            # If no data, use zeros and ones
+            self.feature_mean = np.zeros(self.n_features)
+            self.feature_std = np.ones(self.n_features)
+            logging.warning("No data found to compute normalization stats")
+    
+    def __len__(self):
+        """Return the number of sequences in the dataset"""
+        return len(self.product_sequences)
+    
+    def __getitem__(self, idx):
+        """Get a sequence by index"""
+        product_id, seq_start = self.product_sequences[idx]
+        
+        # Load data for this product
+        if self.data_path.suffix.lower() == '.parquet':
+            product_df = pd.read_parquet(self.data_path, filters=[('unique_id', '==', product_id)])
+        else:
+            product_df = pd.read_csv(self.data_path)
+            product_df = product_df[product_df['unique_id'] == product_id]
+            
+        # Sort by date to ensure correct sequence order
+        product_df['date'] = pd.to_datetime(product_df['date'])
+        product_df = product_df.sort_values('date')
+        
+        # Extract the sequence
+        sequence = product_df[self.feature_columns].iloc[seq_start:seq_start + self.lookback].values
+        target = product_df['sales'].iloc[seq_start + self.lookback]
+        
+        # Apply normalization on-the-fly
+        sequence = (sequence - self.feature_mean) / self.feature_std
+        
+        return torch.tensor(sequence, dtype=torch.float32), torch.tensor([target], dtype=torch.float32)
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
@@ -80,30 +236,6 @@ class LSTMModel(nn.Module):
         out = self.fc2(out)
         
         return out
-
-def load_data():
-    """Load processed data from numpy files."""
-    data_dir = 'data/processed'
-    X_train = np.load(f'{data_dir}/X_train.npy')
-    X_test = np.load(f'{data_dir}/X_test.npy')
-    y_train = np.load(f'{data_dir}/y_train.npy')
-    y_test = np.load(f'{data_dir}/y_test.npy')
-    
-    # Normalize input features
-    X_mean = X_train.mean(axis=(0, 1))  # Mean across batch and sequence
-    X_std = X_train.std(axis=(0, 1))    # Std across batch and sequence
-    X_std[X_std == 0] = 1  # Prevent division by zero
-    
-    X_train = (X_train - X_mean) / X_std
-    X_test = (X_test - X_mean) / X_std
-    
-    # Save normalization parameters
-    np.save(f'{data_dir}/X_mean.npy', X_mean)
-    np.save(f'{data_dir}/X_std.npy', X_std)
-    
-    logging.info(f"Input data normalized. Mean: {X_mean.mean():.4f}, Std: {X_std.mean():.4f}")
-    
-    return X_train, X_test, y_train, y_test
 
 def train_model(model, train_loader, val_loader, device, epochs=50, learning_rate=0.001):
     """
@@ -285,91 +417,84 @@ def train_model(model, train_loader, val_loader, device, epochs=50, learning_rat
 
 def main():
     # Set device
-    device = torch.device("mps" if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
     
-    # Load processed data
-    logging.info("Loading processed data...")
-    X_train, X_test, y_train, y_test = load_data()
+    # Define parameters
+    lookback = 30
+    hidden_size = 64
+    num_layers = 2
+    dropout = 0.2
+    learning_rate = 0.001
+    batch_size = 64
+    epochs = 50
+    test_size = 0.2
+    num_workers = 4  # Number of parallel workers for data loading
     
-    # Split training data into train and validation sets
-    val_size = int(0.2 * len(X_train))
-    X_val = X_train[-val_size:]
-    y_val = y_train[-val_size:]
-    X_train = X_train[:-val_size]
-    y_train = y_train[:-val_size]
+    # Create datasets with streaming data loading
+    data_path = 'data/prepared_sales_data.csv'  # or change to .parquet if converted
     
-    # Create datasets and dataloaders
-    train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train).unsqueeze(1))
-    val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val).unsqueeze(1))
-    test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test).unsqueeze(1))
+    logging.info(f"Creating training dataset...")
+    train_dataset = TimeSeriesDataset(
+        data_path=data_path,
+        lookback=lookback,
+        train=True,
+        test_size=test_size
+    )
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
-    test_loader = DataLoader(test_dataset, batch_size=32)
+    logging.info(f"Creating testing dataset...")
+    test_dataset = TimeSeriesDataset(
+        data_path=data_path,
+        lookback=lookback,
+        train=False,
+        test_size=test_size
+    )
     
-    # Create and train model
-    input_size = X_train.shape[2]  # Number of features
-    model = LSTMModel(input_size=input_size).to(device)
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
     
-    logging.info("Training LSTM model...")
-    model, history = train_model(model, train_loader, val_loader, device)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
     
-    # Load best model for evaluation
-    checkpoint = torch.load('outputs/best_model.pth')
-    model.load_state_dict(checkpoint['model_state_dict'])
+    logging.info(f"Training samples: {len(train_dataset)}")
+    logging.info(f"Testing samples: {len(test_dataset)}")
     
-    # Evaluate model
-    logging.info("\nEvaluating model...")
-    model.eval()
-    test_predictions = []
-    test_targets = []
+    # Create model
+    input_size = len(train_dataset.feature_columns)
+    model = LSTMModel(input_size, hidden_size, num_layers, dropout).to(device)
+    logging.info(f"Created model with {input_size} input features")
     
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            y_pred = model(X_batch)
-            test_predictions.extend(y_pred.cpu().numpy())
-            test_targets.extend(y_batch.cpu().numpy())
+    # Train the model
+    model, history = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        device, 
+        epochs=epochs, 
+        learning_rate=learning_rate
+    )
     
-    # Calculate final metrics
-    test_mae = mean_absolute_error(test_targets, test_predictions)
-    test_rmse = np.sqrt(mean_squared_error(test_targets, test_predictions))
+    # Save the model
+    torch.save(model.state_dict(), 'outputs/lstm_model.pth')
+    logging.info("Model saved to outputs/lstm_model.pth")
     
-    logging.info(f"Test MAE: {test_mae:.4f}")
-    logging.info(f"Test RMSE: {test_rmse:.4f}")
+    # Evaluate on test set
+    test_loss, test_mae = evaluate_model(model, test_loader, device)
+    logging.info(f"Test Loss: {test_loss:.4f}, Test MAE: {test_mae:.4f}")
     
     # Plot training history
-    plt.figure(figsize=(15, 5))
-    
-    # Plot loss
-    plt.subplot(1, 3, 1)
-    plt.plot(history['train_loss'], label='Training Loss')
-    plt.plot(history['val_loss'], label='Validation Loss')
-    plt.title('Model Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    # Plot MAE
-    plt.subplot(1, 3, 2)
-    plt.plot(history['train_mae'], label='Training MAE')
-    plt.plot(history['val_mae'], label='Validation MAE')
-    plt.title('Model MAE')
-    plt.xlabel('Epoch')
-    plt.ylabel('MAE')
-    plt.legend()
-    
-    # Plot learning rate
-    plt.subplot(1, 3, 3)
-    plt.plot(history['learning_rate'])
-    plt.title('Learning Rate')
-    plt.xlabel('Epoch')
-    plt.ylabel('Learning Rate')
-    
-    plt.tight_layout()
-    plt.savefig('outputs/training_history.png')
-    plt.close()
+    plot_training_history(history)
 
 if __name__ == "__main__":
     main() 
