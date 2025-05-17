@@ -11,9 +11,73 @@ The project uses the Rohlík Sales Forecasting Challenge dataset from Kaggle. Th
 
 ```
 demand_forecasting/
-└── data/               # Data directory for storing the dataset
-    └── test_weights.csv  # Weights for test evaluation
+├── src/                       # Source code directory
+│   └── demand_forecasting/    # Python package
+│       ├── data/              # Data processing modules
+│       │   ├── etl.py         # Data extraction and transformation
+│       │   └── sequence.py    # Sequence generation for LSTM
+│       ├── modelling/         # Model definitions
+│       │   └── lstm.py        # LSTM and WaveNet model architecture
+│       ├── train.py           # Training loop and metrics
+│       └── config.yaml        # Configuration parameters
+├── tests/                     # Unit tests
+├── data/                      # Data directory (gitignored except for metadata)
+│   └── processed/             # Processed data files
+├── logs/                      # Training logs
+└── outputs/                   # Model checkpoints and visualizations
 ```
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/demand-forecasting.git
+cd demand-forecasting
+```
+
+2. Create a virtual environment and install dependencies:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -e .
+```
+
+## Usage
+
+### Data Preparation
+
+To prepare the data with feature engineering and temporal sequences:
+
+```bash
+# First run ETL to create processed dataset
+python -m demand_forecasting.data.etl
+
+# Then create time series sequences
+python -m demand_forecasting.data.sequence
+```
+
+### Training
+
+Train the model with default parameters:
+
+```bash
+python -m demand_forecasting.train
+```
+
+With custom configuration:
+
+```bash
+python -m demand_forecasting.train --config path/to/your_config.yaml
+```
+
+### Model Architecture
+
+The project includes two neural network architectures:
+
+1. **LSTM Model**: Captures long-term dependencies in time series data
+2. **WaveNet Model**: Uses dilated convolutions for efficient long-range modeling
+
+You can select the model type in the configuration file.
 
 ## Evaluation
 
@@ -24,34 +88,38 @@ The WMAE is calculated as:
 WMAE = Σ(weight_i * |actual_i - predicted_i|) / Σ(weight_i)
 ```
 
-This metric ensures that errors in predictions are weighted according to their importance, providing a more meaningful evaluation of the model's performance.
+## Configuration
 
-## Getting Started
+Example configuration (from config.yaml):
 
-1. Clone the repository
-2. Download the dataset from Kaggle and place it in the `data/` directory
+```yaml
+# Data parameters
+data:
+  lookback: 30        # Sequence length for time series
+  test_size: 0.2      # Proportion for test set
 
-## Technical Approach
+# Model parameters
+model:
+  type: "lstm"        # Model type (lstm or wavenet)
+  lstm:
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.2
 
-The project will use an LSTM (Long Short-Term Memory) neural network implemented in PyTorch, which is particularly well-suited for time series forecasting tasks. LSTM networks can:
-- Capture long-term dependencies in time series data
-- Handle complex patterns and seasonality
-- Learn from sequential data while maintaining memory of important historical information
-
-## Model Architecture
-
-The LSTM model is designed to:
-- Process time series data with multiple features
-- Capture seasonal patterns and trends
-- Generate accurate sales forecasts for future time periods
+# Training parameters
+training:
+  batch_size: 32
+  epochs: 50
+  learning_rate: 0.001
+```
 
 ## Future Improvements
 
-- Implement additional feature engineering
-- Experiment with different model architectures
-- Add support for multiple product categories
-- Implement ensemble methods
-- Add real-time prediction capabilities
+- Dynamic lookback window size based on product characteristics
+- Attention mechanisms for handling long sequences
+- Transformer-based architectures
+- Multi-task learning for related products
+- Bayesian approaches for uncertainty estimation
 
 ## Contributing
 

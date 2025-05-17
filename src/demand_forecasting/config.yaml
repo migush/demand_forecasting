@@ -1,0 +1,72 @@
+# Demand Forecasting Configuration
+
+# Data parameters
+data:
+  # Path to data files
+  raw_sales_path: "data/sales_train.csv"
+  raw_calendar_path: "data/calendar.csv"
+  processed_path: "data/processed/prepared_sales_data.csv"
+  stats_path: "data/processed/feature_stats.json"
+  
+  # Data processing parameters
+  chunk_size: 100000
+  lookback: 30
+  
+  # Train/test/validation split
+  test_size: 0.2
+  val_size: 0.2
+
+# Model parameters
+model:
+  # Model selection (lstm or wavenet)
+  type: "lstm"
+  
+  # LSTM model parameters
+  lstm:
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.2
+  
+  # WaveNet model parameters
+  wavenet:
+    residual_channels: 32
+    dilation_channels: 32
+    skip_channels: 32
+    layers: 3
+    blocks: 2
+    dropout: 0.2
+
+# Training parameters
+training:
+  # Basic training parameters
+  batch_size: 32
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  
+  # Early stopping
+  patience: 10
+  
+  # Learning rate scheduler
+  lr_scheduler:
+    factor: 0.5
+    patience: 5
+    
+  # Gradient clipping
+  clip_grad_norm: 0.1
+  
+  # Automatic mixed precision (AMP)
+  use_amp: true
+  
+  # Number of workers for data loading
+  num_workers: 2
+
+# Output parameters
+output:
+  # Directories
+  model_dir: "outputs/models"
+  log_dir: "logs"
+  plot_dir: "outputs/plots"
+  
+  # Logging frequency
+  log_batch_interval: 10 
