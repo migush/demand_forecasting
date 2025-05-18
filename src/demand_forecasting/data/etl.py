@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
 import os
 import gc
@@ -208,13 +207,8 @@ def prepare_sales_data(chunk_size=100000, data_path='data/sales_train.csv', cale
             chunk = pd.read_csv(chunk_file)
             chunk.to_csv(outfile, header=False, index=False)
             os.remove(chunk_file)  # Remove temporary file
-    
-    # Create a symlink in the main data directory for backward compatibility
-    if not os.path.exists('data/prepared_sales_data.csv'):
-        os.symlink(output_file, 'data/prepared_sales_data.csv')
-    
+
     print("Data preparation completed!")
-    
     return output_file
 
 def main():
