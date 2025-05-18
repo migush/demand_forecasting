@@ -11,7 +11,7 @@ The project uses the Rohlík Sales Forecasting Challenge dataset from Kaggle. Th
 
 This project uses a streaming data pipeline that loads and processes data on-demand:
 
-1. **Data Preparation**: The raw data is transformed into a prepared dataset with feature engineering (saved as CSV/Parquet)
+1. **Data Preparation**: The raw data is transformed into a prepared dataset with feature engineering (saved as CSV)
 2. **Streaming Dataset**: During training, data is loaded for each product ID only when needed
 3. **On-the-fly Processing**: Window slicing and normalization happen in real-time
 4. **Parallel Processing**: Multiple worker processes handle data loading while GPU trains
@@ -48,38 +48,60 @@ demand_forecasting/
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/demand-forecasting.git
+git clone https://github.com/migush/demand-forecasting.git
 cd demand-forecasting
 ```
 
-2. Create a virtual environment and install dependencies:
+2. Create a virtual environment and install dependencies using `uv`:
 ```bash
-python -m venv .venv
+# Install uv if you don't have it already
+# curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment and install dependencies in one command
+uv venv .venv
+uv pip install -r requirements.txt
+
+# Activate the environment
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+```
+
+3. Install the package in development mode:
+```bash
+uv pip install -e .
 ```
 
 ## Usage
 
 ### Data Preparation
 
-1. Prepare the initial sales data:
-```bash
-python prepare_data.py
-```
-
-2. (Optional) Convert to Parquet for better performance:
-```bash
-python convert_to_parquet.py
-```
-
-### Training
-
-Train the model using the streaming dataset:
+Before training, you need to prepare the data:
 
 ```bash
-python lstm_model_pytorch.py
+# Run the ETL module to prepare the data
+python -m src.demand_forecasting.data.etl
 ```
+
+This will:
+1. Process the raw sales data and calendar data
+2. Create necessary features
+3. Save the prepared data to `data/processed/prepared_sales_data.csv`
+4. Generate feature statistics in `data/processed/feature_stats.json`
+
+### Running the Training Pipeline
+
+After data preparation, you can train the model:
+
+```bash
+# Run with default configuration
+python -m src.demand_forecasting.train
+
+# Or specify a custom config file
+python -m src.demand_forecasting.train --config path/to/your/config.yaml
+```
+
+The default configuration file is located at `src/demand_forecasting/config.yaml`.
+
+> **Note**: If you encounter NaN errors during training, you may need to adjust the learning rate or other hyperparameters in the config file. Try reducing the learning rate to `0.0001` or adding gradient clipping by setting a lower value for `clip_grad_norm` in the config.
 
 ### Testing
 
@@ -87,7 +109,7 @@ Run the test suite using pytest:
 
 ```bash
 # Install the package in development mode
-pip install -e .
+uv pip install -e .
 
 # Run all tests
 pytest

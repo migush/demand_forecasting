@@ -1,7 +1,6 @@
 import pytest
 import torch
 import numpy as np
-import os
 from pathlib import Path
 
 @pytest.fixture(scope="session", autouse=True)
