@@ -12,7 +12,8 @@ import argparse
 from typing import Dict, Tuple, Any, Optional
 
 # Local imports from package
-from demand_forecasting.modelling.lstm import LSTMModel, WaveNetModel
+from demand_forecasting.modelling.lstm import LSTMModel
+from demand_forecasting.modelling.wavenet import WaveNetModel
 from demand_forecasting.data.sequence import get_data_loaders
 
 def setup_logging(log_dir: str) -> None:

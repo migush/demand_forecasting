@@ -51,4 +51,5 @@ best_model.pth
 # macOS specific
 .DS_Store
 .AppleDouble
-.LSOverride 
+.LSOverride .coverage
+kaggle.json
