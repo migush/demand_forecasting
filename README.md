@@ -81,7 +81,33 @@ Train the model using the streaming dataset:
 python lstm_model_pytorch.py
 ```
 
-### Model Architecture
+### Testing
+
+Run the test suite using pytest:
+
+```bash
+# Install the package in development mode
+pip install -e .
+
+# Run all tests
+pytest
+
+# Run tests with coverage report
+pytest --cov=src
+
+# Run tests in parallel (faster)
+pytest -n auto
+
+# Run tests with verbose output
+pytest -xvs
+```
+
+The test suite includes:
+- Model tests to verify model architecture and forward passes
+- Data processing tests to check dataset functionality
+- Integration tests to ensure components work together
+
+## Model Architecture
 
 The project includes two neural network architectures:
 
